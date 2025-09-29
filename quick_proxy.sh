@@ -12,6 +12,9 @@ mkdir -p "$LOGS_DIR"
 HY_PID=""
 ORIGINAL_PROXY_SETTINGS=""
 PROXY_ENABLED=false
+TUN_ENABLED=false
+TUN_INTERFACE=""
+ORIGINAL_DEFAULT_ROUTE=""
 
 # Cleanup function
 cleanup() {
@@ -21,6 +24,12 @@ cleanup() {
     if [[ -n "${HY_PID:-}" ]]; then
         echo "Stopping hysteria client (PID: $HY_PID)..."
         kill $HY_PID 2>/dev/null || true
+    fi
+
+    # Clean up TUN interface if enabled
+    if [[ "$TUN_ENABLED" == true ]]; then
+        echo "Cleaning up TUN interface..."
+        cleanup_tun_interface
     fi
 
     # Restore original proxy settings if we changed them
@@ -244,6 +253,149 @@ restore_system_proxy() {
     esac
 }
 
+# TUN interface management functions
+check_root_privileges() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "❌ TUN mode requires root privileges. Please run with sudo." >&2
+        return 1
+    fi
+    return 0
+}
+
+check_tun_support() {
+    # Check if TUN module is available
+    if ! lsmod | grep -q "^tun "; then
+        echo "🔧 Loading TUN module..."
+        modprobe tun || {
+            echo "❌ Failed to load TUN module. Please ensure TUN support is available." >&2
+            return 1
+        }
+    fi
+
+    # Check if /dev/net/tun exists
+    if [[ ! -c /dev/net/tun ]]; then
+        echo "❌ /dev/net/tun device not found. TUN support not available." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+setup_tun_interface() {
+    local tun_name="hysteria-tun"
+    local tun_ip="10.0.0.1"
+    local tun_subnet="10.0.0.0/24"
+
+    echo "🔧 Setting up TUN interface: $tun_name"
+
+    # Create TUN interface
+    ip tuntap add name "$tun_name" mode tun || {
+        echo "❌ Failed to create TUN interface $tun_name" >&2
+        return 1
+    }
+
+    # Configure IP address
+    ip addr add "$tun_ip/24" dev "$tun_name" || {
+        echo "❌ Failed to assign IP to TUN interface" >&2
+        ip tuntap del name "$tun_name" mode tun 2>/dev/null
+        return 1
+    }
+
+    # Bring interface up
+    ip link set dev "$tun_name" up || {
+        echo "❌ Failed to bring up TUN interface" >&2
+        ip tuntap del name "$tun_name" mode tun 2>/dev/null
+        return 1
+    }
+
+    # Store current default route for restoration
+    ORIGINAL_DEFAULT_ROUTE=$(ip route show default | head -1)
+
+    # Set up routing - route all traffic through TUN interface
+    echo "🔧 Setting up routing for global proxy..."
+
+    # Get the current default gateway
+    local gateway=$(ip route show default | awk '/default/ { print $3; exit }')
+    local interface=$(ip route show default | awk '/default/ { print $5; exit }')
+
+    if [[ -n "$gateway" && -n "$interface" ]]; then
+        # Add specific route for the proxy server to avoid routing loop
+        if [[ -n "$HOST" ]]; then
+            echo "🔧 Adding route for proxy server $HOST via $gateway"
+            ip route add "$HOST/32" via "$gateway" dev "$interface" 2>/dev/null || true
+        fi
+
+        # Replace default route with TUN interface
+        ip route del default 2>/dev/null || true
+        ip route add default dev "$tun_name" metric 1 || {
+            echo "❌ Failed to set default route through TUN interface" >&2
+            cleanup_tun_interface "$tun_name"
+            return 1
+        }
+
+        # Add route for local network to maintain local connectivity
+        local local_network=$(ip route | grep "$interface" | grep -E '192\.168\.|10\.|172\.' | head -1 | awk '{print $1}')
+        if [[ -n "$local_network" && -n "$gateway" ]]; then
+            ip route add "$local_network" via "$gateway" dev "$interface" 2>/dev/null || true
+        fi
+    else
+        echo "⚠️  Warning: Could not determine current gateway. TUN routing may not work properly."
+    fi
+
+    # Configure DNS to use a public DNS server through the TUN interface
+    echo "🔧 Configuring DNS..."
+    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+    cat > /etc/resolv.conf <<EOF
+# Temporary DNS configuration for hysteria TUN mode
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+EOF
+
+    TUN_INTERFACE="$tun_name"
+    TUN_ENABLED=true
+
+    echo "✅ TUN interface $tun_name configured successfully"
+    echo "   • Interface: $tun_name ($tun_ip/24)"
+    echo "   • Status: UP"
+    echo "   • Global routing: Enabled"
+
+    return 0
+}
+
+cleanup_tun_interface() {
+    local tun_name="${1:-$TUN_INTERFACE}"
+
+    if [[ -z "$tun_name" ]]; then
+        return 0
+    fi
+
+    echo "🧹 Cleaning up TUN interface: $tun_name"
+
+    # Restore original DNS configuration
+    if [[ -f /etc/resolv.conf.bak ]]; then
+        echo "🔧 Restoring original DNS configuration..."
+        mv /etc/resolv.conf.bak /etc/resolv.conf 2>/dev/null || true
+    fi
+
+    # Restore original default route
+    if [[ -n "$ORIGINAL_DEFAULT_ROUTE" ]]; then
+        echo "🔧 Restoring original default route..."
+        ip route del default 2>/dev/null || true
+        ip route add $ORIGINAL_DEFAULT_ROUTE 2>/dev/null || true
+    fi
+
+    # Remove TUN interface
+    if ip link show "$tun_name" >/dev/null 2>&1; then
+        ip link set dev "$tun_name" down 2>/dev/null || true
+        ip tuntap del name "$tun_name" mode tun 2>/dev/null || true
+        echo "✅ TUN interface $tun_name removed"
+    fi
+
+    TUN_ENABLED=false
+    TUN_INTERFACE=""
+}
+
 # Authentication validation function
 validate_auth() {
     local auth="$1"
@@ -263,7 +415,7 @@ validate_auth() {
 
 usage() {
     cat <<EOF
-Usage: $0 [-z URI] [-p PORT] [--no-system-proxy] [--daemon] | URI
+Usage: $0 [-z URI] [-p PORT] [--no-system-proxy] [--daemon] [--tun] | URI
 
 Creates a quick proxy server from a hysteria2 link and registers it as system proxy.
 
@@ -271,12 +423,14 @@ Examples:
     $0 "hysteria2://uuid@1.2.3.4:9989?security=tls&alpn=h3&insecure=1&sni=www.bing.com"
     $0 -z "hysteria2://..." -p 1080 --no-system-proxy
     $0 -z "hysteria2://..." --daemon
+    $0 -z "hysteria2://..." --tun --daemon
 
 Options:
     -z, --uri            hysteria2 URI
     -p, --port           SOCKS5 listening port (default: 1080)
     --no-system-proxy    Don't register as system proxy
     --daemon             Run in background (daemon mode)
+    --tun                Enable TUN mode for global transparent proxy (requires root)
     -h, --help           show this help
 EOF
     exit 2
@@ -287,6 +441,7 @@ URI=""
 SOCKS_PORT="1080"
 SET_SYSTEM_PROXY=true
 DAEMON_MODE=false
+TUN_MODE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -299,6 +454,8 @@ while [[ $# -gt 0 ]]; do
             SET_SYSTEM_PROXY=false; shift;;
         --daemon)
             DAEMON_MODE=true; shift;;
+        --tun)
+            TUN_MODE=true; shift;;
         -h|--help)
             usage;;
         --)
@@ -331,6 +488,7 @@ echo "URI: $URI"
 echo "SOCKS5 Port: $SOCKS_PORT"
 echo "System Proxy: $([ "$SET_SYSTEM_PROXY" = true ] && echo "Enabled" || echo "Disabled")"
 echo "Daemon Mode: $([ "$DAEMON_MODE" = true ] && echo "Enabled" || echo "Disabled")"
+echo "TUN Mode: $([ "$TUN_MODE" = true ] && echo "Enabled" || echo "Disabled")"
 echo ""
 
 # Parse URI components (same logic as original script)
@@ -365,8 +523,50 @@ if ! validate_auth "$AUTH"; then
 fi
 echo "✅ 认证验证通过"
 
+# TUN mode setup and validation
+if [[ "$TUN_MODE" = true ]]; then
+    echo "🔧 Setting up TUN mode..."
+
+    # Check root privileges
+    if ! check_root_privileges; then
+        log_failure "TUN mode requires root privileges"
+        exit 8
+    fi
+    echo "✅ Root privileges confirmed"
+
+    # Check TUN support
+    if ! check_tun_support; then
+        log_failure "TUN support not available"
+        exit 9
+    fi
+    echo "✅ TUN support available"
+
+    # Override system proxy setting for TUN mode
+    SET_SYSTEM_PROXY=false
+    echo "ℹ️  System proxy disabled (TUN mode provides global proxy)"
+fi
+
 # Create JSON config file
-cat > tmp.json <<EOF
+if [[ "$TUN_MODE" = true ]]; then
+    # TUN mode configuration
+    cat > tmp.json <<EOF
+{
+  "server": "$HOST:$PORT",
+  "auth": "$AUTH",
+  "tls": {
+    "sni": "$SNI",
+    "insecure": true,
+    "alpn": ["h3"]
+  },
+  "tun": {
+    "name": "hysteria-tun",
+    "mtu": 1500
+  }
+}
+EOF
+else
+    # SOCKS5 mode configuration
+    cat > tmp.json <<EOF
 {
   "server": "$HOST:$PORT",
   "auth": "$AUTH",
@@ -380,6 +580,7 @@ cat > tmp.json <<EOF
   }
 }
 EOF
+fi
 
 # Check hysteria binary
 HYSTERIA_BIN="./hysteria"
@@ -396,38 +597,72 @@ echo "🔄 Starting hysteria client..."
 HY_PID=$!
 echo "Hysteria client started with PID: $HY_PID"
 
-# Wait for local socks5 listen (timeout) by trying to open a TCP connection
-echo "⏳ Waiting for local socks5 127.0.0.1:$SOCKS_PORT to be ready..."
-WAIT=0
-MAX_WAIT=15
-while true; do
-    # try opening a TCP connection using bash /dev/tcp — quick and reliable
-    if (echo > /dev/tcp/127.0.0.1/$SOCKS_PORT) >/dev/null 2>&1; then
-        break
-    fi
-    sleep 1
-    WAIT=$((WAIT+1))
-    if [[ $WAIT -ge $MAX_WAIT ]]; then
-        echo "❌ socks5 not listening after ${MAX_WAIT}s. Showing hysteria.log:" >&2
-        sed -n '1,200p' hysteria.log >&2 || true
-        log_failure "Connection timeout - socks5 proxy not ready after ${MAX_WAIT}s"
-        exit 3
-    fi
-done
+# Setup TUN interface if TUN mode is enabled
+if [[ "$TUN_MODE" = true ]]; then
+    echo "⏳ Waiting for hysteria client to initialize..."
+    sleep 2  # Give hysteria a moment to start up
 
-echo "✅ SOCKS5 proxy is listening on 127.0.0.1:$SOCKS_PORT"
+    if ! setup_tun_interface; then
+        log_failure "Failed to setup TUN interface"
+        exit 10
+    fi
+fi
 
-# Test proxy connection
-echo "🌐 Testing proxy connection..."
-status=$(curl -s -o /dev/null -w "%{http_code}" -x socks5h://127.0.0.1:$SOCKS_PORT https://google.com --connect-timeout 10 || true)
-echo "HTTP status: ${status}"
-if [[ "$status" == "301" ]]; then
-    echo "✅ 代理测试成功（返回 301 重定向）"
-    log_success "HTTP $status - Proxy test successful"
+# Test connection based on mode
+if [[ "$TUN_MODE" = true ]]; then
+    # In TUN mode, test direct internet connection
+    echo "🌐 Testing TUN mode global proxy connection..."
+
+    # Wait a bit for routing to stabilize
+    echo "⏳ Waiting for routing to stabilize..."
+    sleep 3
+
+    # Test direct connection (should go through TUN interface)
+    status=$(curl -s -o /dev/null -w "%{http_code}" https://google.com --connect-timeout 15 || true)
+    echo "HTTP status: ${status}"
+    if [[ "$status" == "301" || "$status" == "200" ]]; then
+        echo "✅ TUN模式全局代理测试成功（返回 $status）"
+        log_success "HTTP $status - TUN mode global proxy test successful"
+    else
+        echo "❌ TUN模式代理测试未通过，状态码: ${status}"
+        echo "检查hysteria.log获取更多信息"
+        log_failure "TUN mode proxy test failed - HTTP status: ${status}"
+        exit 4
+    fi
 else
-    echo "❌ 代理测试未通过，状态码: ${status}"
-    log_failure "Proxy test failed - HTTP status: ${status}"
-    exit 4
+    # SOCKS5 mode - original logic
+    echo "⏳ Waiting for local socks5 127.0.0.1:$SOCKS_PORT to be ready..."
+    WAIT=0
+    MAX_WAIT=15
+    while true; do
+        # try opening a TCP connection using bash /dev/tcp — quick and reliable
+        if (echo > /dev/tcp/127.0.0.1/$SOCKS_PORT) >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        WAIT=$((WAIT+1))
+        if [[ $WAIT -ge $MAX_WAIT ]]; then
+            echo "❌ socks5 not listening after ${MAX_WAIT}s. Showing hysteria.log:" >&2
+            sed -n '1,200p' hysteria.log >&2 || true
+            log_failure "Connection timeout - socks5 proxy not ready after ${MAX_WAIT}s"
+            exit 3
+        fi
+    done
+
+    echo "✅ SOCKS5 proxy is listening on 127.0.0.1:$SOCKS_PORT"
+
+    # Test proxy connection
+    echo "🌐 Testing proxy connection..."
+    status=$(curl -s -o /dev/null -w "%{http_code}" -x socks5h://127.0.0.1:$SOCKS_PORT https://google.com --connect-timeout 10 || true)
+    echo "HTTP status: ${status}"
+    if [[ "$status" == "301" ]]; then
+        echo "✅ 代理测试成功（返回 301 重定向）"
+        log_success "HTTP $status - Proxy test successful"
+    else
+        echo "❌ 代理测试未通过，状态码: ${status}"
+        log_failure "Proxy test failed - HTTP status: ${status}"
+        exit 4
+    fi
 fi
 
 # Set system proxy if requested
@@ -441,19 +676,37 @@ echo ""
 echo "🎉 Quick Proxy Setup Complete!"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📍 Proxy Details:"
-echo "   • SOCKS5: 127.0.0.1:$SOCKS_PORT"
-echo "   • Server: $HOST:$PORT"
-echo "   • Status: ✅ Active"
-if [[ "$SET_SYSTEM_PROXY" = true ]]; then
-echo "   • System Proxy: ✅ Enabled"
+if [[ "$TUN_MODE" = true ]]; then
+    echo "   • Mode: ✅ TUN (Global Transparent Proxy)"
+    echo "   • Interface: $TUN_INTERFACE (10.0.0.1/24)"
+    echo "   • Server: $HOST:$PORT"
+    echo "   • Status: ✅ Active"
+    echo "   • Global Routing: ✅ Enabled"
+else
+    echo "   • SOCKS5: 127.0.0.1:$SOCKS_PORT"
+    echo "   • Server: $HOST:$PORT"
+    echo "   • Status: ✅ Active"
+    if [[ "$SET_SYSTEM_PROXY" = true ]]; then
+        echo "   • System Proxy: ✅ Enabled"
+    fi
 fi
 echo ""
-echo "🔧 Manual Configuration:"
-echo "   HTTP/HTTPS Proxy: 127.0.0.1:$SOCKS_PORT"
-echo "   SOCKS5 Proxy: 127.0.0.1:$SOCKS_PORT"
-echo ""
-echo "📝 Usage:"
-echo "   curl -x socks5h://127.0.0.1:$SOCKS_PORT https://example.com"
+if [[ "$TUN_MODE" = true ]]; then
+    echo "🌐 Global Proxy Active:"
+    echo "   All network traffic is automatically routed through the proxy"
+    echo "   No manual configuration needed for applications"
+    echo ""
+    echo "📝 Verification:"
+    echo "   curl https://api.ipify.org  # Check your external IP"
+    echo "   ping 8.8.8.8  # Test connectivity"
+else
+    echo "🔧 Manual Configuration:"
+    echo "   HTTP/HTTPS Proxy: 127.0.0.1:$SOCKS_PORT"
+    echo "   SOCKS5 Proxy: 127.0.0.1:$SOCKS_PORT"
+    echo ""
+    echo "📝 Usage:"
+    echo "   curl -x socks5h://127.0.0.1:$SOCKS_PORT https://example.com"
+fi
 echo ""
 
 if [[ "$DAEMON_MODE" = true ]]; then
