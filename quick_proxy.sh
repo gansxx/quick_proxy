@@ -253,6 +253,256 @@ restore_system_proxy() {
     esac
 }
 
+# Clear system proxy function (standalone operation)
+clear_system_proxy() {
+    echo "🧹 Clearing system proxy settings..."
+
+    local desktop_env=$(detect_desktop_environment)
+    echo "Detected desktop environment: $desktop_env"
+
+    case "${desktop_env,,}" in
+        *gnome*|*unity*|*cinnamon*)
+            if command -v gsettings >/dev/null 2>&1; then
+                echo "Clearing GNOME proxy settings..."
+                gsettings set org.gnome.system.proxy mode 'none'
+                echo "✅ GNOME proxy settings cleared"
+            else
+                echo "⚠️ gsettings not found, clearing environment variables"
+                unset http_proxy https_proxy ftp_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY
+                echo "✅ Environment proxy variables cleared"
+            fi
+            ;;
+        *kde*|*plasma*)
+            if command -v kwriteconfig5 >/dev/null 2>&1; then
+                echo "Clearing KDE proxy settings..."
+                kwriteconfig5 --file kioslaverc --group 'Proxy Settings' --key ProxyType 0
+                dbus-send --type=signal /KIO/Scheduler org.kde.KIO.Scheduler.reparseSlaveConfiguration string:''
+                echo "✅ KDE proxy settings cleared"
+            else
+                echo "⚠️ kwriteconfig5 not found, clearing environment variables"
+                unset http_proxy https_proxy ftp_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY
+                echo "✅ Environment proxy variables cleared"
+            fi
+            ;;
+        *)
+            echo "Clearing environment proxy variables..."
+            unset http_proxy https_proxy ftp_proxy HTTP_PROXY HTTPS_PROXY FTP_PROXY
+            echo "✅ Environment proxy variables cleared"
+            ;;
+    esac
+
+    echo ""
+    echo "🎉 System proxy settings have been cleared!"
+    echo "Your system should now use direct internet connection."
+}
+
+# JSON storage functions for saved links
+LINKS_DIR="./saved_links"
+LINKS_FILE="$LINKS_DIR/links.json"
+BACKUP_DIR="$LINKS_DIR/backups"
+
+init_links_storage() {
+    mkdir -p "$LINKS_DIR" "$BACKUP_DIR"
+
+    if [[ ! -f "$LINKS_FILE" ]]; then
+        cat > "$LINKS_FILE" << 'EOF'
+{
+  "links": [],
+  "metadata": {
+    "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "version": "1.0"
+  }
+}
+EOF
+    fi
+}
+
+# Check if jq is available, fallback to basic parsing if not
+has_jq() {
+    command -v jq >/dev/null 2>&1
+}
+
+# Generate unique ID for a link
+generate_link_id() {
+    local timestamp=$(date +%s)
+    local random=$(shuf -i 1000-9999 -n 1 2>/dev/null || echo $RANDOM)
+    echo "link_${timestamp}_${random}"
+}
+
+# Create backup of links file
+backup_links_file() {
+    if [[ -f "$LINKS_FILE" ]]; then
+        local backup_name="links_backup_$(date +%Y%m%d_%H%M%S).json"
+        cp "$LINKS_FILE" "$BACKUP_DIR/$backup_name"
+        echo "Backup created: $BACKUP_DIR/$backup_name"
+    fi
+}
+
+# Save link information to JSON storage
+save_link_info() {
+    local name="$1"
+    local uri="$2"
+    local host="$3"
+    local port="$4"
+    local auth="$5"
+    local sni="$6"
+
+    init_links_storage
+    backup_links_file
+
+    local link_id=$(generate_link_id)
+    local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if has_jq; then
+        # Use jq for proper JSON manipulation
+        local new_link=$(jq -n \
+            --arg id "$link_id" \
+            --arg name "$name" \
+            --arg uri "$uri" \
+            --arg host "$host" \
+            --arg port "$port" \
+            --arg auth "$auth" \
+            --arg sni "$sni" \
+            --arg created "$timestamp" \
+            --arg last_used "$timestamp" \
+            '{
+                id: $id,
+                name: $name,
+                uri: $uri,
+                parsed: {
+                    host: $host,
+                    port: $port,
+                    auth: $auth,
+                    sni: $sni
+                },
+                created: $created,
+                last_used: $last_used,
+                usage_count: 1
+            }')
+
+        jq --argjson newlink "$new_link" '.links += [$newlink]' "$LINKS_FILE" > "$LINKS_FILE.tmp" && mv "$LINKS_FILE.tmp" "$LINKS_FILE"
+    else
+        # Fallback: basic JSON manipulation without jq
+        # Remove the last } and ]} to append new entry
+        head -n -2 "$LINKS_FILE" > "$LINKS_FILE.tmp"
+
+        # Add comma if not the first entry
+        if grep -q '"links": \[\]' "$LINKS_FILE.tmp"; then
+            sed -i 's/"links": \[\]/"links": [/' "$LINKS_FILE.tmp"
+        else
+            echo '    ,' >> "$LINKS_FILE.tmp"
+        fi
+
+        # Add the new link entry
+        cat >> "$LINKS_FILE.tmp" << EOF
+    {
+      "id": "$link_id",
+      "name": "$name",
+      "uri": "$uri",
+      "parsed": {
+        "host": "$host",
+        "port": "$port",
+        "auth": "$auth",
+        "sni": "$sni"
+      },
+      "created": "$timestamp",
+      "last_used": "$timestamp",
+      "usage_count": 1
+    }
+  ]
+}
+EOF
+        mv "$LINKS_FILE.tmp" "$LINKS_FILE"
+    fi
+
+    echo "✅ Link saved as '$name' (ID: $link_id)"
+    return 0
+}
+
+# Load link information by name or ID
+load_link_info() {
+    local identifier="$1"
+
+    if [[ ! -f "$LINKS_FILE" ]]; then
+        echo "❌ No saved links found" >&2
+        return 1
+    fi
+
+    local link_data
+    if has_jq; then
+        # Try to find by name first, then by ID
+        link_data=$(jq -r ".links[] | select(.name == \"$identifier\" or .id == \"$identifier\")" "$LINKS_FILE" 2>/dev/null)
+
+        if [[ -z "$link_data" || "$link_data" == "null" ]]; then
+            echo "❌ Link '$identifier' not found" >&2
+            return 1
+        fi
+
+        # Extract the URI and update usage
+        URI=$(echo "$link_data" | jq -r '.uri')
+        local link_id=$(echo "$link_data" | jq -r '.id')
+
+        # Update last_used and usage_count
+        local timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        jq --arg id "$link_id" --arg timestamp "$timestamp" \
+           '(.links[] | select(.id == $id) | .last_used) = $timestamp |
+            (.links[] | select(.id == $id) | .usage_count) += 1' \
+           "$LINKS_FILE" > "$LINKS_FILE.tmp" && mv "$LINKS_FILE.tmp" "$LINKS_FILE"
+    else
+        # Fallback: basic grep-based search
+        if grep -q "\"name\": \"$identifier\"" "$LINKS_FILE" || grep -q "\"id\": \"$identifier\"" "$LINKS_FILE"; then
+            URI=$(grep -A 10 -B 2 "\"name\": \"$identifier\"\|\"id\": \"$identifier\"" "$LINKS_FILE" | grep '"uri"' | cut -d'"' -f4)
+            if [[ -z "$URI" ]]; then
+                echo "❌ Failed to extract URI for '$identifier'" >&2
+                return 1
+            fi
+        else
+            echo "❌ Link '$identifier' not found" >&2
+            return 1
+        fi
+    fi
+
+    echo "✅ Loaded saved link: $identifier"
+    echo "URI: $URI"
+    return 0
+}
+
+# List all saved links
+list_saved_links() {
+    if [[ ! -f "$LINKS_FILE" ]]; then
+        echo "No saved links found."
+        return 0
+    fi
+
+    if has_jq; then
+        local count=$(jq '.links | length' "$LINKS_FILE")
+        if [[ "$count" -eq 0 ]]; then
+            echo "No saved links found."
+            return 0
+        fi
+
+        echo "📋 Saved Links ($count):"
+        echo "===================="
+        jq -r '.links[] | "🔗 \(.name) (ID: \(.id))\n   Host: \(.parsed.host):\(.parsed.port)\n   Usage: \(.usage_count) times\n   Last used: \(.last_used)\n"' "$LINKS_FILE"
+    else
+        echo "📋 Saved Links:"
+        echo "===================="
+        grep -A 15 '"name":' "$LINKS_FILE" | grep -E '"name"|"host"|"port"|"usage_count"|"last_used"' | \
+        while read -r line; do
+            if [[ "$line" =~ \"name\" ]]; then
+                name=$(echo "$line" | cut -d'"' -f4)
+                echo "🔗 $name"
+            elif [[ "$line" =~ \"host\" ]]; then
+                host=$(echo "$line" | cut -d'"' -f4)
+                echo -n "   Host: $host"
+            elif [[ "$line" =~ \"port\" ]]; then
+                port=$(echo "$line" | cut -d'"' -f4)
+                echo ":$port"
+            fi
+        done
+    fi
+}
+
 # TUN interface management functions
 check_root_privileges() {
     if [[ $EUID -ne 0 ]]; then
@@ -415,7 +665,7 @@ validate_auth() {
 
 usage() {
     cat <<EOF
-Usage: $0 [-z URI] [-p PORT] [--no-system-proxy] [--daemon] [--tun] | URI
+Usage: $0 [-z URI] [-p PORT] [--save-as NAME] [--load NAME] [--list-saved] [--no-system-proxy] [--daemon] [--tun] [--clear-proxy] | URI
 
 Creates a quick proxy server from a hysteria2 link and registers it as system proxy.
 
@@ -424,13 +674,21 @@ Examples:
     $0 -z "hysteria2://..." -p 1080 --no-system-proxy
     $0 -z "hysteria2://..." --daemon
     $0 -z "hysteria2://..." --tun --daemon
+    $0 -z "hysteria2://..." --save-as "my-server"
+    $0 --load "my-server"
+    $0 --list-saved
+    $0 --clear-proxy
 
 Options:
     -z, --uri            hysteria2 URI
     -p, --port           SOCKS5 listening port (default: 1080)
+    --save-as NAME       Save current URI with given name for future use
+    --load NAME          Load a previously saved URI by name or ID
+    --list-saved         List all saved links
     --no-system-proxy    Don't register as system proxy
     --daemon             Run in background (daemon mode)
     --tun                Enable TUN mode for global transparent proxy (requires root)
+    --clear-proxy        Clear/disable system proxy settings and exit
     -h, --help           show this help
 EOF
     exit 2
@@ -442,6 +700,10 @@ SOCKS_PORT="1080"
 SET_SYSTEM_PROXY=true
 DAEMON_MODE=false
 TUN_MODE=false
+CLEAR_PROXY=false
+SAVE_AS=""
+LOAD_LINK=""
+LIST_SAVED=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -456,6 +718,14 @@ while [[ $# -gt 0 ]]; do
             DAEMON_MODE=true; shift;;
         --tun)
             TUN_MODE=true; shift;;
+        --clear-proxy)
+            CLEAR_PROXY=true; shift;;
+        --save-as)
+            SAVE_AS="$2"; shift 2;;
+        --load)
+            LOAD_LINK="$2"; shift 2;;
+        --list-saved)
+            LIST_SAVED=true; shift;;
         -h|--help)
             usage;;
         --)
@@ -470,6 +740,44 @@ while [[ $# -gt 0 ]]; do
             shift;;
     esac
 done
+
+# Handle clear proxy mode (standalone operation)
+if [[ "$CLEAR_PROXY" = true ]]; then
+    # Validate that no conflicting options are used
+    if [[ -n "$URI" || "$DAEMON_MODE" = true || "$TUN_MODE" = true ]]; then
+        echo "❌ --clear-proxy cannot be used with other proxy options" >&2
+        exit 1
+    fi
+
+    clear_system_proxy
+    exit 0
+fi
+
+# Handle list saved links mode
+if [[ "$LIST_SAVED" = true ]]; then
+    # Validate that no conflicting options are used
+    if [[ -n "$URI" || -n "$SAVE_AS" || -n "$LOAD_LINK" || "$DAEMON_MODE" = true || "$TUN_MODE" = true ]]; then
+        echo "❌ --list-saved cannot be used with other options" >&2
+        exit 1
+    fi
+
+    list_saved_links
+    exit 0
+fi
+
+# Handle load link mode
+if [[ -n "$LOAD_LINK" ]]; then
+    # Validate that URI is not also provided
+    if [[ -n "$URI" ]]; then
+        echo "❌ Cannot use both --load and direct URI" >&2
+        exit 1
+    fi
+
+    if ! load_link_info "$LOAD_LINK"; then
+        exit 1
+    fi
+    # URI is now set by load_link_info
+fi
 
 if [[ -z "$URI" ]]; then
     echo "No URI provided" >&2
@@ -522,6 +830,19 @@ if ! validate_auth "$AUTH"; then
     exit 5
 fi
 echo "✅ 认证验证通过"
+
+# Handle save functionality if requested
+if [[ -n "$SAVE_AS" ]]; then
+    echo "💾 Saving link configuration as '$SAVE_AS'..."
+
+    if save_link_info "$SAVE_AS" "$URI" "$HOST" "$PORT" "$AUTH" "$SNI"; then
+        echo "✅ Link configuration saved successfully"
+    else
+        echo "❌ Failed to save link configuration" >&2
+        # Continue with proxy setup even if save fails
+    fi
+    echo ""
+fi
 
 # TUN mode setup and validation
 if [[ "$TUN_MODE" = true ]]; then
