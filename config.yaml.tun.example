@@ -1,0 +1,28 @@
+server: your-server-ip-or-domain:443
+
+auth: your-uuid
+
+bandwidth:
+  up: 100 mbps
+  down: 100 mbps
+
+tls:
+  sni: www.bing.com
+  insecure: true
+  alpn: [h3]
+
+tun:
+  name: hytun
+  mtu: 1500
+  timeout: 5m
+  address:
+    # Avoid 100.64.0.0/10 or 100.100.x.x when tailscale is present.
+    ipv4: 172.19.0.1/29
+    ipv6: fd00:1::1/126
+  route:
+    ipv4: [0.0.0.0/0]
+    ipv6: ["2000::/3"]
+    # Must exclude your actual hysteria server endpoint.
+    ipv4Exclude: [your-server-ip/32]
+    # Optional: add real IPv6 excludes only if needed.
+    ipv6Exclude: []

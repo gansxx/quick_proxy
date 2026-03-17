@@ -1,0 +1,17 @@
+# Runtime logs and pid
+logs/
+*.log
+*.pid
+
+# Local runtime temp files
+tmp.json
+
+# Local/private runtime config
+config.yaml
+
+# Optional downloaded binaries
+hysteria-linux-*
+
+# Saved runtime snapshots
+saved_links/backups/
+saved_links/
